@@ -1,43 +1,84 @@
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
-const Database = require('better-sqlite3');
+const OpenAI = require('openai');
 
 const app = express();
 app.use(express.json());
-
-const db = new Database('orders.db');
-
-// Создаём таблицу заявок
-db.exec(`
-  CREATE TABLE IF NOT EXISTS orders (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    phone TEXT,
-    name TEXT,
-    address TEXT,
-    district TEXT,
-    meters INTEGER,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  )
-`);
 
 const ID_INSTANCE = process.env.ID_INSTANCE;
 const API_TOKEN = process.env.API_TOKEN;
 const DISPATCHER_PHONE = process.env.DISPATCHER_PHONE;
 const API_URL = `https://7107.api.greenapi.com`;
 
-// Состояния диалога
-const sessions = {};
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+const sessions = new Map();
+const pausedClients = new Set();
+
+const SYSTEM_PROMPT = `Ты онлайн-помощник компании по установке и поверке счётчиков воды в Казахстане. Сегодня ${new Date().toLocaleDateString('ru-RU')}. Отвечай на русском или казахском — на том языке на котором пишет клиент. Будь вежливым и кратким.
+
+ВАЖНО: Если клиент пишет не по теме счётчиков воды — вежливо скажи что можешь помочь только по вопросам установки, замены, поверки и пломбировки счётчиков воды.
+
+ЦЕНЫ:
+КВАРТИРА:
+- Установка: 18 000 ₸
+- Замена 1 счётчик: 12 000 ₸
+- Замена 2 и более: 11 000 ₸ за штуку
+- Поверка 1 счётчик: 7 500 ₸
+- Поверка 2 и более: 6 500 ₸ за штуку
+- Пломбировка: 6 000 ₸
+
+ЧАСТНЫЙ ДОМ:
+- Замена: 15 000 ₸ (не делаем если счётчик в колодце)
+- Поверка холодной воды: 10 000 ₸ (не делаем если счётчик в колодце)
+- Горячую воду в частном доме не поверяем
+- Установку в частном доме не делаем
+
+ЮРИДИЧЕСКИЕ ЛИЦА:
+- Поверка горячей воды: 15 000 ₸
+- Остальные работы не делаем
+
+АКЦИЯ (действует сейчас, обязательно сообщай клиенту!):
+- Квартира, замена 2 и более: 10 000 ₸ за штуку
+- Квартира, поверка 2 и более: 5 000 ₸ за штуку
+
+ЗАПИСЬ НА ДАТУ:
+- Записываем только на завтра и позже
+- Если клиент просит на сегодня — скажи: "К сожалению, на сегодня запись закрыта. Свяжитесь с диспетчером или запишитесь на завтра."
+
+ВРЕМЯ ВИЗИТА:
+- Точное время не назначаем — мастер приедет в течение дня
+- Если клиент настаивает на времени — уточни: "Можем указать до обеда или после обеда, точное время не фиксируем"
+- Варианты времени: "в течение дня" / "до обеда" / "после обеда"
+
+СБОР ЗАЯВКИ:
+Когда клиент готов записаться, собери по одному вопросу:
+1. Лицевой счёт (номер из квитанции Алсеко)
+2. Адрес
+3. Количество счётчиков
+4. Контактный телефон
+5. Вид работ (установка/замена/поверка/пломбировка)
+6. Тип объекта (квартира/частный дом/юрлицо)
+7. Желаемая дата (завтра или позже)
+8. Время визита (в течение дня / до обеда / после обеда)
+
+Когда все данные собраны — скажи клиенту: "Ваша заявка принята! Диспетчер свяжется с вами для подтверждения."
+Затем напиши строго: ЗАЯВКА_ГОТОВА: и все данные клиента.`;
 
 async function sendMessage(phone, message) {
-  await axios.post(`${API_URL}/waInstance${ID_INSTANCE}/sendMessage/${API_TOKEN}`, {
-    chatId: `${phone}@c.us`,
-    message: message
-  });
+  try {
+    await axios.post(`${API_URL}/waInstance${ID_INSTANCE}/sendMessage/${API_TOKEN}`, {
+      chatId: `${phone}@c.us`,
+      message: message
+    });
+  } catch (e) {
+    console.error('Ошибка отправки:', e.message);
+  }
 }
 
-async function notifyDispatcher(order) {
-  const text = `🆕 Новая заявка!\n\nИмя: ${order.name}\nАдрес: ${order.address}\nРайон: ${order.district}\nСчётчиков: ${order.meters}\nТелефон: ${order.phone}`;
+async function notifyDispatcher(phone, orderText) {
+  const text = `🆕 Новая заявка!\nТелефон клиента: +${phone}\n\n${orderText}`;
   await sendMessage(DISPATCHER_PHONE, text);
 }
 
@@ -51,40 +92,52 @@ app.post('/webhook', async (req, res) => {
   const phone = body.senderData.sender.replace('@c.us', '');
   const text = body.messageData.textMessageData.textMessage.trim();
 
-  if (!sessions[phone]) sessions[phone] = { step: 0 };
-  const session = sessions[phone];
+  // Диспетчер написал — останавливаем бота для последнего активного клиента
+  if (phone === DISPATCHER_PHONE) {
+    const clients = [...sessions.keys()].filter(p => p !== DISPATCHER_PHONE);
+    const lastClient = clients[clients.length - 1];
+    if (lastClient) {
+      pausedClients.add(lastClient);
+      await sendMessage(DISPATCHER_PHONE, `Бот остановлен для клиента +${lastClient}. Общайтесь вручную.`);
+    }
+    return;
+  }
 
-  if (session.step === 0) {
-    await sendMessage(phone, 'Здравствуйте! Я бот службы поверки счётчиков. Как вас зовут?');
-    session.step = 1;
-  } else if (session.step === 1) {
-    session.name = text;
-    await sendMessage(phone, 'Укажите ваш адрес (улица, дом, квартира):');
-    session.step = 2;
-  } else if (session.step === 2) {
-    session.address = text;
-    await sendMessage(phone, 'В каком районе?');
-    session.step = 3;
-  } else if (session.step === 3) {
-    session.district = text;
-    await sendMessage(phone, 'Сколько счётчиков нужно поверить?');
-    session.step = 4;
-  } else if (session.step === 4) {
-    session.meters = text;
+  // Клиент на паузе — бот молчит
+  if (pausedClients.has(phone)) return;
 
-    // Сохраняем заявку
-    db.prepare('INSERT INTO orders (phone, name, address, district, meters) VALUES (?, ?, ?, ?, ?)')
-      .run(phone, session.name, session.address, session.district, session.meters);
+  if (!sessions.has(phone)) sessions.set(phone, []);
+  const history = sessions.get(phone);
+  history.push({ role: 'user', content: text });
 
-    await sendMessage(phone, `Спасибо, ${session.name}! Ваша заявка принята. Наш диспетчер свяжется с вами в ближайшее время.`);
+  try {
+    const response = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [
+        { role: 'system', content: SYSTEM_PROMPT },
+        ...history
+      ],
+      max_tokens: 600
+    });
 
-    // Уведомляем диспетчера
-    await notifyDispatcher({ phone, ...session });
+    const reply = response.choices[0].message.content;
+    history.push({ role: 'assistant', content: reply });
 
-    delete sessions[phone];
+    // Убираем служебную метку перед отправкой клиенту
+    const clientReply = reply.replace(/ЗАЯВКА_ГОТОВА:[\s\S]*/g, '').trim();
+    if (clientReply) await sendMessage(phone, clientReply);
+
+    // Уведомляем диспетчера если заявка готова
+    if (reply.includes('ЗАЯВКА_ГОТОВА:')) {
+      const orderData = reply.split('ЗАЯВКА_ГОТОВА:')[1].trim();
+      await notifyDispatcher(phone, orderData);
+    }
+
+  } catch (error) {
+    console.error('OpenAI error:', error.message);
   }
 });
 
-app.listen(process.env.PORT, () => {
-  console.log(`Бот запущен на порту ${process.env.PORT}`);
+app.listen(process.env.PORT || 3000, () => {
+  console.log(`Бот запущен на порту ${process.env.PORT || 3000}`);
 });
