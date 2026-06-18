@@ -152,18 +152,18 @@ app.post('/webhook', async (req, res) => {
     const reply = response.choices[0].message.content;
     history.push({ role: 'assistant', content: reply });
 
-    // Убираем служебную метку перед отправкой клиенту
-    const clientReply = reply.replace(/ЗАЯВКА_ГОТОВА:[\s\S]*/g, '').trim();
+    // Убираем служебные метки перед отправкой клиенту
+    const clientReply = reply.replace(/ЗАЯВКА_ГОТОВА[\s\S]*/g, '').replace(/ВЫЗОВ_ДИСПЕТЧЕРА[\s\S]*/g, '').trim();
     if (clientReply) await sendMessage(phone, clientReply);
 
     // Уведомляем диспетчера если заявка готова
-    if (reply.includes('ЗАЯВКА_ГОТОВА:')) {
-      const orderData = reply.split('ЗАЯВКА_ГОТОВА:')[1].trim();
+    if (reply.includes('ЗАЯВКА_ГОТОВА')) {
+      const orderData = reply.split('ЗАЯВКА_ГОТОВА')[1].replace(/^[:\s]+/, '').trim();
       await notifyDispatcher(phone, orderData);
     }
 
     // Клиент просит соединить с диспетчером
-    if (reply.includes('ВЫЗОВ_ДИСПЕТЧЕРА:')) {
+    if (reply.includes('ВЫЗОВ_ДИСПЕТЧЕРА')) {
       pausedClients.add(phone);
       await sendMessage(DISPATCHER_PHONE, `📞 Клиент +${phone} просит связаться с диспетчером. Пожалуйста, напишите ему.`);
     }
